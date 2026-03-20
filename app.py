@@ -8,11 +8,10 @@ TEA_FILE = 'Прайс ЧАЙ 2026.xlsx'
 COFFEE_FILE = 'Прайс закуп КОФЕ 2026.xls'
 OZON_REPORT = 'Озон Отчет по начислениям_01.01.2026-20.03.2026.csv'
 
-st.set_page_config(page_title="Ozon P&L Final", layout="wide")
+st.set_page_config(page_title="Ozon P&L Final Fix", layout="wide")
 
 def clean_num(value):
     if pd.isna(value): return 0.0
-    # Очистка: оставляем только цифры, точки и минус
     s = str(value).replace('₽', '').replace('\xa0', '').replace(' ', '').replace(',', '.')
     cleaned = "".join([c for c in s if c.isdigit() or c in '.-'])
     try: return float(cleaned)
@@ -21,19 +20,19 @@ def clean_num(value):
 def load_data():
     prices = {}
     
-    # 1. ЗАГРУЗКА ПРАЙСОВ
+    # 1. ЗАГРУЗКА ПРАЙСОВ (Чай и Кофе)
     try:
-        # Чай - используем ваше название колонки 'Чай черный ароматизированный'
+        # Чай
         df_tea = pd.read_excel(os.path.join(DATA_FOLDER, TEA_FILE), sheet_name='Чай', skiprows=2)
         df_tea.columns = [str(c).strip() for c in df_tea.columns]
         
-        name_col_tea = 'Чай черный ароматизированный'
-        # Пытаемся взять цену из '80' или 'Предоплата'
-        price_col_tea = '80' if '80' in df_tea.columns else 'Предоплата'
+        # Используем ваше название колонки 'Чай черный ароматизированный'
+        tea_name_col = 'Чай черный ароматизированный'
+        tea_price_col = '80' if '80' in df_tea.columns else 'Предоплата'
         
-        if name_col_tea in df_tea.columns:
-            for _, r in df_tea.dropna(subset=[name_col_tea]).iterrows():
-                prices[str(r[name_col_tea]).lower().strip()] = clean_num(r.get(price_col_tea))
+        if tea_name_col in df_tea.columns:
+            for _, r in df_tea.dropna(subset=[tea_name_col]).iterrows():
+                prices[str(r[tea_name_col]).lower().strip()] = clean_num(r.get(tea_price_col))
 
         # Кофе
         df_cof = pd.read_excel(os.path.join(DATA_FOLDER, COFFEE_FILE), sheet_name='Кофе', skiprows=1)
@@ -44,40 +43,40 @@ def load_data():
     except Exception as e:
         st.error(f"Ошибка в прайсах: {e}")
 
-    # 2. ЗАГРУЗКА OZON (С защитой от битых символов)
+    # 2. ЗАГРУЗКА OZON (CSV в кодировке IBM866)
     try:
         path = os.path.join(DATA_FOLDER, OZON_REPORT)
         
-        # Читаем файл, принудительно заменяя нечитаемые символы на "?"
-        # Это лечит ошибку 'charmap' decode
-        with open(path, 'r', encoding='cp1251', errors='replace') as f:
-            df = pd.read_csv(f, sep=';', skiprows=1)
-            
+        # Читаем в кодировке ibm866, чтобы победить "краказябры"
+        df = pd.read_csv(path, sep=';', skiprows=1, encoding='ibm866')
         df.columns = [str(c).strip() for c in df.columns]
 
-        if 'Название товара' not in df.columns:
-            st.error(f"Колонки не найдены. Доступны: {list(df.columns)}")
-            return None, None
+        # Названия колонок из вашего лога (авто-детект)
+        col_name = 'Ќ\xa0§ў\xa0\xadЁҐ в®ў\xa0а' # Название товара
+        col_payout = '‘г¬¬\xa0 Ёв®Ј®, агЎ.' # Сумма итого
+        col_sale = '–Ґ\xad\xa0 Їа®¤\xa0ўж' # Цена продавца
+        col_qty = 'Љ®«ЁзҐбвў®' # Количество
 
-        # Группировка транзакций
-        summary = df.groupby('Название товара').agg({
-            'Сумма итого, руб.': lambda x: sum(clean_num(i) for i in x),
-            'Цена продавца': lambda x: max(clean_num(i) for i in x),
-            'Количество': lambda x: sum(clean_num(i) for i in x if clean_num(i) > 0)
+        # Группируем все строки по товару
+        summary = df.groupby(col_name).agg({
+            col_payout: lambda x: sum(clean_num(i) for i in x),
+            col_sale: lambda x: max(clean_num(i) for i in x),
+            col_qty: lambda x: sum(clean_num(i) for i in x if clean_num(i) > 0)
         }).reset_index()
 
         results = []
         not_found = []
 
         for _, row in summary.iterrows():
-            name = str(row['Название товара'])
-            if 'nan' in name.lower() or not name or 'итого' in name.lower(): continue
+            name = str(row[col_name])
+            # Условие пропуска пустых строк или итогов
+            if 'nan' in name.lower() or not name or 'Ёв®Ј®' in name: continue
             
-            payout = row['Сумма итого, руб.']
-            sale_price = row['Цена продавца']
-            qty = row['Количество']
+            payout = row[col_payout]
+            sale_price = row[col_sale]
+            qty = row[col_qty]
 
-            # Поиск закупки (ищем короткое название из прайса в длинном названии Озона)
+            # Поиск в прайсах (по частичному совпадению)
             cost_1kg = None
             name_lower = name.lower()
             for p_name, p_val in prices.items():
@@ -99,26 +98,26 @@ def load_data():
                     'Прибыль': payout - unit_cost - tax
                 })
             else:
-                not_found.append({'Товар из Ozon': name, 'Выплата': payout})
+                not_found.append({'Товар из Ozon': name, 'Сумма': payout})
 
         return pd.DataFrame(results), pd.DataFrame(not_found)
     except Exception as e:
-        st.error(f"Ошибка в отчете Ozon: {e}")
+        st.error(f"Ошибка Ozon: {e}")
         return None, None
 
 # --- ИНТЕРФЕЙС ---
-st.title("📊 Итоговый P&L: Анализ прибыли")
+st.title("📊 Итоговая аналитика прибыли")
 data, missing = load_data()
 
 if data is not None and not data.empty:
     c1, c2, c3 = st.columns(3)
-    c1.metric("Всего от Ozon (Net)", f"{data['Выплата Ozon'].sum():,.2f} ₽")
-    c2.metric("Налог УСН (с продаж)", f"{data['Налог 6%'].sum():,.2f} ₽")
+    c1.metric("Приход от Ozon", f"{data['Выплата Ozon'].sum():,.2f} ₽")
+    c2.metric("Налог (6%)", f"{data['Налог 6%'].sum():,.2f} ₽")
     c3.metric("ЧИСТАЯ ПРИБЫЛЬ", f"{data['Прибыль'].sum():,.2f} ₽")
 
     st.dataframe(data.sort_values('Прибыль', ascending=False), use_container_width=True)
 
 if missing is not None and not missing.empty:
-    with st.expander("⚠️ Товары без сопоставления цен"):
-        st.write("Эти товары найдены в Ozon, но не найдены в прайсах:")
+    with st.expander("⚠️ Товары, не найденные в прайсах"):
+        st.write("Для этих товаров из Ozon не удалось найти цену закупки:")
         st.table(missing)
