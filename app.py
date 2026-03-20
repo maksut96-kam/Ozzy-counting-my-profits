@@ -8,26 +8,19 @@ TEA_FILE = 'Прайс ЧАЙ 2026.xlsx'
 COFFEE_FILE = 'Прайс закуп КОФЕ 2026.xls'
 OZON_REPORT = 'Озон Отчет Начисления 01.01.2026-20.03.2026.csv'
 
-st.set_page_config(page_title="Ozon P&L Pro", layout="wide")
+st.set_page_config(page_title="Ozon P&L Final Logic", layout="wide")
 
 def clean_num(value):
-    """Превращает любую строку с мусором (₽, пробелы, запятые) в чистое число float"""
     if pd.isna(value): return 0.0
     if isinstance(value, (int, float)): return float(value)
-    
-    # Удаляем символ рубля, неразрывные пробелы и обычные пробелы
     s = str(value).replace('₽', '').replace('\xa0', '').replace(' ', '').replace(',', '.')
-    # Оставляем только цифры, точку и минус
     cleaned = "".join([c for c in s if c.isdigit() or c in '.-'])
-    
-    try:
-        return float(cleaned)
-    except:
-        return 0.0
+    try: return float(cleaned)
+    except: return 0.0
 
 def load_data():
     prices = {}
-    # 1. Загрузка прайсов (без изменений)
+    # 1. Загрузка цен закупки
     try:
         df_tea = pd.read_excel(os.path.join(DATA_FOLDER, TEA_FILE), sheet_name='Чай', skiprows=2)
         df_tea.columns = [str(c).strip() for c in df_tea.columns]
@@ -42,81 +35,79 @@ def load_data():
     except Exception as e:
         st.error(f"Ошибка в прайсах: {e}")
 
-    # 2. Обработка Ozon
+    # 2. Обработка Ozon по уникальным ID начислений
     try:
-        path = os.path.join(DATA_FOLDER, OZON_REPORT)
-        df = pd.read_csv(path, sep=';', encoding='utf-8')
+        df = pd.read_csv(os.path.join(DATA_FOLDER, OZON_REPORT), sep=';', encoding='utf-8')
         df.columns = [str(c).strip() for c in df.columns]
         
-        # Предварительно очищаем все числовые колонки
+        # Чистим числа сразу
         df['Сумма итого, руб.'] = df['Сумма итого, руб.'].apply(clean_num)
         df['Цена продавца'] = df['Цена продавца'].apply(clean_num)
         df['Количество'] = df['Количество'].apply(clean_num)
-        
-        # Группируем по товару
-        # Логика: Сумма итого — это чистый приход от Озона по всем транзакциям (доход - расход)
-        # Цена продавца — берем среднее или макс, так как она одинаковая для всех строк одного заказа
-        # Количество — берем макс в группе (это и есть реальное кол-во штук в заказе)
-        summary = df.groupby('Название товара').agg({
-            'Сумма итого, руб.': 'sum',
-            'Цена продавца': 'max',
-            'Количество': 'max'
+
+        # ШАГ 1: Схлопываем транзакции по ID начисления
+        # Это дает нам финансовый результат по каждой отдельной продаже
+        order_summary = df.groupby('ID начисления').agg({
+            'Название товара': 'first',
+            'Сумма итого, руб.': 'sum', # Суммируем доходы и расходы по заказу
+            'Цена продавца': 'max',     # Грязная цена для налога
+            'Количество': 'max'         # Кол-во штук в этом заказе
         }).reset_index()
 
-        results = []
-        for _, row in summary.iterrows():
-            name = str(row['Название товара'])
-            if not name or 'nan' in name.lower() or 'итого' in name.lower():
-                continue
-            
-            payout_ozon = row['Сумма итого, руб.']
-            sale_price = row['Цена продавца']
-            qty = row['Количество']
+        # ШАГ 2: Собираем итоговую таблицу по товарам
+        final_table = []
+        unique_products = order_summary['Название товара'].unique()
 
-            # Сопоставление с закупкой
-            cost_1kg = None
-            name_lower = name.lower()
+        for product in unique_products:
+            if pd.isna(product) or 'итого' in str(product).lower(): continue
+            
+            product_orders = order_summary[order_summary['Название товара'] == product]
+            
+            total_qty = product_orders['Количество'].sum()
+            total_payout = product_orders['Сумма итого, руб.'].sum()
+            # Оборот для налога (Цена * Кол-во по каждому заказу)
+            total_turnover = (product_orders['Цена продавца'] * product_orders['Количество']).sum()
+
+            # Ищем себестоимость
+            cost_1kg = 0.0
             for p_name, p_val in prices.items():
-                if p_name in name_lower:
+                if p_name in str(product).lower():
                     cost_1kg = p_val
                     break
             
-            if cost_1kg:
-                is_half = any(m in name_lower for m in ['500 гр', '500г', '0.5'])
-                total_cost = (cost_1kg / 2 if is_half else cost_1kg) * qty
-                # Налог всегда с ГРЯЗНОЙ цены продажи
-                tax = (sale_price * qty) * 0.06
-                profit = payout_ozon - total_cost - tax
+            if cost_1kg > 0:
+                is_half = any(m in str(product).lower() for m in ['500 гр', '500г', '0.5'])
+                total_purchase_cost = (cost_1kg / 2 if is_half else cost_1kg) * total_qty
+                tax = total_turnover * 0.06
+                profit = total_payout - total_purchase_cost - tax
                 
-                results.append({
-                    'Товар': name,
-                    'Кол-во': qty,
-                    'Чистый приход Ozon': payout_ozon,
-                    'Себестоимость': total_cost,
+                final_table.append({
+                    'Товар': product,
+                    'Продано (шт)': int(total_qty),
+                    'От Ozon (Чистыми)': total_payout,
+                    'Закупка (Всего)': total_purchase_cost,
                     'Налог 6%': tax,
                     'Прибыль': profit
                 })
         
-        return pd.DataFrame(results)
+        return pd.DataFrame(final_table)
     except Exception as e:
-        st.error(f"Ошибка в анализе Ozon: {e}")
+        st.error(f"Ошибка в расчетах: {e}")
         return None
 
 # --- ИНТЕРФЕЙС ---
-st.title("📊 Итоговый P&L Анализ")
+st.title("📊 Итоговый P&L Анализ (по Заказам)")
 data = load_data()
 
 if data is not None and not data.empty:
-    # Итоговые карточки
     c1, c2, c3 = st.columns(3)
-    c1.metric("Приход от Ozon", f"{data['Чистый приход Ozon'].sum():,.2f} ₽")
-    c2.metric("Налог УСН", f"{data['Налог 6%'].sum():,.2f} ₽")
+    c1.metric("Приход от Ozon", f"{data['От Ozon (Чистыми)'].sum():,.2f} ₽")
+    c2.metric("Себестоимость", f"{data['Закупка (Всего)'].sum():,.2f} ₽")
     c3.metric("ЧИСТАЯ ПРИБЫЛЬ", f"{data['Прибыль'].sum():,.2f} ₽")
     
-    # Расчет ROI (Рентабельность вложений)
-    data['ROI %'] = (data['Прибыль'] / data['Себестоимость'] * 100).replace([float('inf'), -float('inf')], 0)
+    # Добавляем маржинальность
+    data['Маржа %'] = (data['Прибыль'] / data['От Ozon (Чистыми)'] * 100)
     
-    st.subheader("Детализация по товарам")
     st.dataframe(data.sort_values('Прибыль', ascending=False), use_container_width=True)
 else:
-    st.info("Данные загружаются или файлы не найдены.")
+    st.warning("Данные не найдены. Проверьте файл в папке data.")
