@@ -12,17 +12,26 @@ st.set_page_config(page_title="P&L Analytics Final", layout="wide")
 
 def clean_num(value):
     try:
-        if pd.isna(value): return 0.0
+        if pd.isna(value) or value == 'нет': return 0.0
         return float(value)
     except: return 0.0
 
-def find_sheet_data(path, sheet, target_col):
-    """Ищет, на какой строке находится нужная колонка, и возвращает чистый DataFrame"""
-    for s in range(0, 10):
+def get_col_by_keyword(df, keywords):
+    """Ищет колонку, в названии которой есть хотя бы одно из ключевых слов"""
+    for col in df.columns:
+        if any(k.lower() in str(col).lower() for k in keywords):
+            return col
+    return None
+
+def load_sheet_safe(path, sheet_name=0):
+    """Пробует загрузить лист, перебирая варианты пропуска строк"""
+    for s in range(0, 15):
         try:
-            df = pd.read_excel(path, sheet_name=sheet, skiprows=s)
+            df = pd.read_excel(path, sheet_name=sheet_name, skiprows=s)
+            # Убираем пустые колонки и чистим имена
             df.columns = [str(c).strip() for c in df.columns]
-            if any(target_col.lower() in str(c).lower() for c in df.columns):
+            # Если в таблице есть хоть какие-то данные
+            if len(df.columns) > 2:
                 return df
         except: continue
     return None
@@ -31,47 +40,50 @@ def load_data():
     try:
         prices = {}
         
-        # 1. Загрузка ЧАЯ
+        # 1. ЗАГРУЗКА ЧАЯ
         path_tea = os.path.join(DATA_FOLDER, TEA_FILE)
-        df_tea = find_sheet_data(path_tea, 'Чай', 'Наименование')
+        df_tea = load_sheet_safe(path_tea, 'Чай')
         if df_tea is not None:
-            # Находим реальное имя колонки (с учетом регистра/пробелов)
-            name_col = [c for c in df_tea.columns if 'наименование' in c.lower()][0]
-            price_col = [c for c in df_tea.columns if 'предоплата' in c.lower()][0]
-            for _, r in df_tea.dropna(subset=[name_col]).iterrows():
-                prices[str(r[name_col]).lower().strip()] = clean_num(r.get(price_col))
+            c_name = get_col_by_keyword(df_tea, ['Наименование', 'Товар', 'Название'])
+            c_price = get_col_by_keyword(df_tea, ['Предоплата', 'Цена', 'Закуп'])
+            if c_name and c_price:
+                for _, r in df_tea.dropna(subset=[c_name]).iterrows():
+                    prices[str(r[c_name]).lower().strip()] = clean_num(r[c_price])
 
-        # 2. Загрузка КОФЕ
+        # 2. ЗАГРУЗКА КОФЕ
         path_cof = os.path.join(DATA_FOLDER, COFFEE_FILE)
-        df_cof = find_sheet_data(path_cof, 'Кофе', 'Кофе Ароматизированный')
+        df_cof = load_sheet_safe(path_cof, 'Кофе')
         if df_cof is not None:
-            name_col = [c for c in df_cof.columns if 'кофе ароматизированный' in c.lower()][0]
-            price_col = [c for c in df_cof.columns if 'прайс 2026' in c.lower()][0]
-            for _, r in df_cof.dropna(subset=[name_col]).iterrows():
-                prices[str(r[name_col]).lower().strip()] = clean_num(r.get(price_col))
+            c_name = get_col_by_keyword(df_cof, ['Кофе Ароматизированный', 'Наименование', 'Товар'])
+            c_price = get_col_by_keyword(df_cof, ['Прайс 2026', 'Цена', 'Закуп'])
+            if c_name and c_price:
+                for _, r in df_cof.dropna(subset=[c_name]).iterrows():
+                    prices[str(r[c_name]).lower().strip()] = clean_num(r[c_price])
 
-        # 3. Загрузка OZON
+        # 3. ЗАГРУЗКА OZON
         path_ozon = os.path.join(DATA_FOLDER, OZON_REPORT)
-        df_sales = find_sheet_data(path_ozon, 0, 'Название товара') # берем первый лист
+        df_sales = load_sheet_safe(path_ozon, 0) # Первый лист
 
-        if df_sales is None:
-            st.error("Не удалось найти колонку 'Название товара' в отчете Ozon")
+        if df_sales is None: return None
+
+        # Ищем колонки Озона
+        o_name = get_col_by_keyword(df_sales, ['Название товара'])
+        o_payout = get_col_by_keyword(df_sales, ['Итого к начислению'])
+        o_sale = get_col_by_keyword(df_sales, ['Цена реализации'])
+
+        if not all([o_name, o_payout, o_sale]):
+            st.error(f"В Озоне не найдены колонки. Нашел: Название={o_name}, Выплата={o_payout}, Продажа={o_sale}")
             return None
 
         results = []
-        # Определяем имена колонок Ozon
-        ozon_name_col = [c for c in df_sales.columns if 'название товара' in c.lower()][0]
-        ozon_payout_col = [c for c in df_sales.columns if 'итого к начислению' in c.lower()][0]
-        ozon_sale_col = [c for c in df_sales.columns if 'цена реализации' in c.lower()][0]
-
         for _, row in df_sales.iterrows():
-            name = str(row.get(ozon_name_col, ''))
+            name = str(row.get(o_name, ''))
             if not name or name == 'nan' or 'итого' in name.lower(): continue
 
-            payout = clean_num(row.get(ozon_payout_col, 0))
-            sale_price = clean_num(row.get(ozon_sale_col, 0))
+            payout = clean_num(row.get(o_payout, 0))
+            sale_price = clean_num(row.get(o_sale, 0))
             
-            # Поиск соответствия
+            # Поиск в прайсе
             cost_1kg = None
             name_lower = name.lower()
             for p_name, p_val in prices.items():
@@ -95,7 +107,7 @@ def load_data():
         
         return pd.DataFrame(results)
     except Exception as e:
-        st.error(f"Критическая ошибка: {e}")
+        st.error(f"Ошибка в логике: {e}")
         return None
 
 # --- ИНТЕРФЕЙС ---
@@ -103,7 +115,7 @@ st.title("📊 Итоговая аналитика прибыли")
 res = load_data()
 
 if res is not None and not res.empty:
-    # Общие итоги для метрик
+    # Метрики
     total_p = res['Выплата Озон'].sum()
     total_t = res['Налог 6%'].sum()
     total_net = res['Прибыль'].sum()
@@ -113,10 +125,16 @@ if res is not None and not res.empty:
     c2.metric("Налоги", f"{total_t:,.2f} ₽")
     c3.metric("ЧИСТАЯ ПРИБЫЛЬ", f"{total_net:,.2f} ₽")
 
-    # Итоговая строка для таблицы
-    totals = pd.DataFrame([{'Товар': '💰 ИТОГО', 'Выплата Озон': total_p, 'Себестоимость': res['Себестоимость'].sum(), 'Налог 6%': total_t, 'Прибыль': total_net}])
+    # Итоговая строка
+    totals = pd.DataFrame([{
+        'Товар': '💰 ИТОГО', 
+        'Выплата Озон': total_p, 
+        'Себестоимость': res['Себестоимость'].sum(), 
+        'Налог 6%': total_t, 
+        'Прибыль': total_net
+    }])
     final_tab = pd.concat([res, totals], ignore_index=True)
 
     st.dataframe(final_tab, use_container_width=True)
 else:
-    st.warning("Данные не найдены. Проверьте названия листов и колонок в файлах.")
+    st.warning("Данные не найдены или не сопоставлены. Проверьте файлы в папке /data")
