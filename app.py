@@ -2,59 +2,96 @@ import streamlit as st
 import pandas as pd
 import os
 
+# --- НАСТРОЙКИ ---
 DATA_FOLDER = 'data' 
 TEA_FILE = 'Прайс ЧАЙ 2026.xlsx'
 COFFEE_FILE = 'Прайс закуп КОФЕ 2026.xls'
-OZON_REPORT = 'Озон Отчет по начислениям_01.01.2026-20.03.2026.csv' # Теперь CSV
+OZON_REPORT = 'Озон Отчет по начислениям_01.01.2026-20.03.2026.csv'
 
-st.set_page_config(page_title="Ozon P&L Pro", layout="wide")
+st.set_page_config(page_title="Ozon P&L Final", layout="wide")
 
 def clean_num(value):
     if pd.isna(value): return 0.0
-    s = str(value).replace('₽', '').replace(' ', '').replace('\xa0', '').replace(',', '.')
+    # Очистка строки от валюты, пробелов и замена запятой на точку
+    s = str(value).replace('₽', '').replace('\xa0', '').replace(' ', '').replace(',', '.')
     try: return float(s)
     except: return 0.0
 
+def get_col(df, keys):
+    """Ищет колонку по списку ключевых слов"""
+    for c in df.columns:
+        if any(k.lower() in str(c).lower().strip() for k in keys):
+            return c
+    return None
+
 def load_data():
-    # 1. Загрузка цен (оставляем как было, это работало)
     prices = {}
+    
+    # 1. ЗАГРУЗКА ПРАЙСОВ (Чай и Кофе)
     try:
-        df_tea = pd.read_excel(os.path.join(DATA_FOLDER, TEA_FILE), sheet_name='Чай', skiprows=2)
-        for _, r in df_tea.dropna(subset=['Наименование']).iterrows():
-            prices[str(r['Наименование']).lower().strip()] = clean_num(r.get('Предоплата'))
+        # Чай
+        path_tea = os.path.join(DATA_FOLDER, TEA_FILE)
+        # Пробуем разные skiprows, пока не найдем колонку "Наименование"
+        for s in range(0, 10):
+            df_tea = pd.read_excel(path_tea, sheet_name='Чай', skiprows=s)
+            c_n = get_col(df_tea, ['Наименование', 'Товар'])
+            c_p = get_col(df_tea, ['Предоплата', 'Цена'])
+            if c_n and c_p:
+                for _, r in df_tea.dropna(subset=[c_n]).iterrows():
+                    prices[str(r[c_n]).lower().strip()] = clean_num(r[c_p])
+                break
         
-        df_cof = pd.read_excel(os.path.join(DATA_FOLDER, COFFEE_FILE), sheet_name='Кофе', skiprows=1)
-        for _, r in df_cof.dropna(subset=['Кофе Ароматизированный']).iterrows():
-            prices[str(r['Кофе Ароматизированный']).lower().strip()] = clean_num(r.get('Прайс 2026'))
+        # Кофе
+        path_cof = os.path.join(DATA_FOLDER, COFFEE_FILE)
+        for s in range(0, 10):
+            df_cof = pd.read_excel(path_cof, sheet_name='Кофе', skiprows=s)
+            c_n = get_col(df_cof, ['Кофе Ароматизированный', 'Наименование'])
+            c_p = get_col(df_cof, ['Прайс 2026', 'Цена'])
+            if c_n and c_p:
+                for _, r in df_cof.dropna(subset=[c_n]).iterrows():
+                    prices[str(r[c_n]).lower().strip()] = clean_num(r[c_p])
+                break
     except Exception as e:
         st.error(f"Ошибка в прайсах: {e}")
 
-    # 2. Загрузка и обработка CSV Озона
+    # 2. ЗАГРУЗКА OZON CSV (Исправление кодировки)
     try:
-        # Читаем CSV с учетом точки с запятой
-        df_ozon = pd.read_csv(os.path.join(DATA_FOLDER, OZON_REPORT), sep=';', skiprows=1)
+        path_ozon = os.path.join(DATA_FOLDER, OZON_REPORT)
+        # Пробуем разные кодировки (Ozon часто шлет в windows-1251)
+        try:
+            df_ozon = pd.read_csv(path_ozon, sep=';', skiprows=1, encoding='utf-8')
+        except:
+            df_ozon = pd.read_csv(path_ozon, sep=';', skiprows=1, encoding='cp1251')
+        
         df_ozon.columns = [c.strip() for c in df_ozon.columns]
+        
+        # Ключевые колонки
+        o_name = get_col(df_ozon, ['Название товара'])
+        o_payout = get_col(df_ozon, ['Сумма итого'])
+        o_sale = get_col(df_ozon, ['Цена продавца'])
+        o_qty = get_col(df_ozon, ['Количество'])
 
-        # Группируем данные по товару, чтобы собрать все комиссии и логистику в одну сумму
-        # Суммируем "Сумма итого, руб." - это наш чистый приход
-        # Максимум "Цена продавца" - это база для налога
-        # Сумма "Количество" - сколько штук продано
-        summary = df_ozon.groupby('Название товара').agg({
-            'Сумма итого, руб.': 'sum',
-            'Цена продавца': 'max',
-            'Количество': 'max' 
+        if not all([o_name, o_payout, o_sale]):
+            st.error("Не найдены нужные колонки в CSV. Проверьте заголовки.")
+            return None
+
+        # Группируем транзакции по товару
+        summary = df_ozon.groupby(o_name).agg({
+            o_payout: 'sum',
+            o_sale: 'max',
+            o_qty: 'max'
         }).reset_index()
 
         results = []
         for _, row in summary.iterrows():
-            name = str(row['Название товара'])
+            name = str(row[o_name])
             if 'nan' in name.lower() or not name: continue
             
-            payout = row['Сумма итого, руб.']
-            sale_price = row['Цена продавца']
-            quantity = row['Количество']
+            payout = clean_num(row[o_payout])
+            sale_price = clean_num(row[o_sale])
+            quantity = clean_num(row[o_qty])
 
-            # Ищем себестоимость в прайсах
+            # Поиск себестоимости
             cost_1kg = None
             name_lower = name.lower()
             for p_name, p_val in prices.items():
@@ -71,10 +108,10 @@ def load_data():
                 results.append({
                     'Товар': name,
                     'Кол-во': quantity,
-                    'Выплата (Net)': payout,
-                    'Закупка (Total)': unit_cost,
+                    'Выплата Ozon': payout,
+                    'Закупка': unit_cost,
                     'Налог 6%': tax,
-                    'Чистая прибыль': profit
+                    'Прибыль': profit
                 })
 
         return pd.DataFrame(results)
@@ -83,15 +120,16 @@ def load_data():
         return None
 
 # --- ИНТЕРФЕЙС ---
-st.title("📊 Точный P&L: Анализ транзакций Ozon")
+st.title("📊 Итоговый P&L по транзакциям")
 data = load_data()
 
 if data is not None and not data.empty:
+    total_net = data['Прибыль'].sum()
     c1, c2, c3 = st.columns(3)
-    c1.metric("Итого к выплате", f"{data['Выплата (Net)'].sum():,.2f} ₽")
-    c2.metric("Налог УСН", f"{data['Налог 6%'].sum():,.2f} ₽")
-    c3.metric("ЧИСТАЯ ПРИБЫЛЬ", f"{data['Чистая прибыль'].sum():,.2f} ₽")
+    c1.metric("Всего от Ozon (чистыми)", f"{data['Выплата Ozon'].sum():,.2f} ₽")
+    c2.metric("Налог (с продаж)", f"{data['Налог 6%'].sum():,.2f} ₽")
+    c3.metric("ЧИСТАЯ ПРИБЫЛЬ", f"{total_net:,.2f} ₽")
 
-    st.dataframe(data.sort_values('Чистая прибыль', ascending=False), use_container_width=True)
+    st.dataframe(data.sort_values('Прибыль', ascending=False), use_container_width=True)
 else:
-    st.info("Данные обрабатываются...")
+    st.info("Файлы анализируются...")
